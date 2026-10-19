@@ -64,7 +64,22 @@ pub(super) struct AntigravityQuotaInfo {
 
 #[derive(Deserialize)]
 pub(super) struct AntigravityQuotaSummaryResponse {
+    #[serde(default)]
     groups: Option<Vec<AntigravityQuotaSummaryGroup>>,
+    #[serde(default)]
+    response: Option<Box<AntigravityQuotaSummaryResponse>>,
+}
+
+impl AntigravityQuotaSummaryResponse {
+    pub(super) fn groups(&self) -> &[AntigravityQuotaSummaryGroup] {
+        if let Some(ref groups) = self.groups {
+            groups
+        } else if let Some(ref inner) = self.response {
+            inner.groups()
+        } else {
+            &[]
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -88,11 +103,174 @@ pub(super) struct AntigravityQuotaSummaryBucket {
     reset_time: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct LocalLanguageServerEndpoint {
+    pub(super) port: u16,
+    pub(super) csrf_token: String,
+}
+
+static LOCAL_LS_ENDPOINT: std::sync::Mutex<Option<LocalLanguageServerEndpoint>> =
+    std::sync::Mutex::new(None);
+
+pub(super) fn query_language_server(
+    endpoint: &LocalLanguageServerEndpoint,
+) -> Result<UsageData, PollError> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(2000)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+
+    let url = format!(
+        "http://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+        endpoint.port
+    );
+
+    let mut resp = agent
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("x-codeium-csrf-token", &endpoint.csrf_token)
+        .header("Connect-Protocol-Version", "1")
+        .send_json(&serde_json::json!({}))
+        .map_err(|_| PollError::NetworkError)?;
+
+    if !resp.status().is_success() {
+        return Err(PollError::HttpStatus(resp.status().as_u16()));
+    }
+
+    let response: AntigravityQuotaSummaryResponse = resp
+        .body_mut()
+        .read_json()
+        .map_err(|_| PollError::UnexpectedResponse)?;
+
+    antigravity_usage_from_summary(response).ok_or(PollError::UnexpectedResponse)
+}
+
+pub(super) fn extract_csrf_token(cmdline: &str) -> Option<String> {
+    let key = "--csrf_token";
+    let idx = cmdline.find(key)?;
+    let rest = cmdline[idx + key.len()..].trim_start_matches(|c| c == '=' || c == ' ');
+    let token = rest
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .find(|s| !s.is_empty())?;
+    Some(token.to_string())
+}
+
+#[cfg(windows)]
+pub(super) fn discover_local_language_servers() -> Vec<LocalLanguageServerEndpoint> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let ps_script = r#"
+$procs = Get-CimInstance Win32_Process -Filter "Name like '%language_server%'"
+foreach ($p in $procs) {
+    $ports = (Get-NetTCPConnection -OwningProcess $p.ProcessId -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort)
+    $portStr = $ports -join ','
+    Write-Output "$($p.ProcessId)|$portStr|$($p.CommandLine)"
+}
+"#;
+
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-Command", ps_script]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = match cmd.output() {
+        Ok(out) if out.status.success() => out.stdout,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output);
+    let mut candidates = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(3, '|').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let port_str = parts[1];
+        let cmdline = parts[2];
+
+        let Some(csrf) = extract_csrf_token(cmdline) else {
+            continue;
+        };
+
+        for port_item in port_str.split(',') {
+            if let Ok(port) = port_item.trim().parse::<u16>() {
+                candidates.push(LocalLanguageServerEndpoint {
+                    port,
+                    csrf_token: csrf.clone(),
+                });
+            }
+        }
+    }
+
+    candidates
+}
+
+#[cfg(not(windows))]
+pub(super) fn discover_local_language_servers() -> Vec<LocalLanguageServerEndpoint> {
+    Vec::new()
+}
+
+pub(super) fn poll_local_language_server() -> Option<UsageData> {
+    // 1. Try cached endpoint
+    let cached = {
+        let lock = LOCAL_LS_ENDPOINT.lock().ok()?;
+        lock.clone()
+    };
+
+    if let Some(endpoint) = cached {
+        match query_language_server(&endpoint) {
+            Ok(usage) => {
+                diagnose::log(format!(
+                    "Antigravity usage retrieved from local language server on port {}",
+                    endpoint.port
+                ));
+                return Some(usage);
+            }
+            Err(err) => {
+                diagnose::log(format!(
+                    "Antigravity cached local language server port {} failed: {err:?}",
+                    endpoint.port
+                ));
+                if let Ok(mut lock) = LOCAL_LS_ENDPOINT.lock() {
+                    *lock = None;
+                }
+            }
+        }
+    }
+
+    // 2. Discover active endpoints
+    let candidates = discover_local_language_servers();
+    for candidate in candidates {
+        if let Ok(usage) = query_language_server(&candidate) {
+            diagnose::log(format!(
+                "Antigravity connected to local language server on port {}",
+                candidate.port
+            ));
+            if let Ok(mut lock) = LOCAL_LS_ENDPOINT.lock() {
+                *lock = Some(candidate);
+            }
+            return Some(usage);
+        }
+    }
+
+    None
+}
+
 pub(super) fn poll_antigravity() -> Result<UsageData, PollError> {
+    if let Some(usage) = poll_local_language_server() {
+        return Ok(usage);
+    }
+
     let creds = match read_antigravity_credentials() {
         Some(creds) => creds,
         None => {
-            diagnose::log("Antigravity usage poll failed: no Antigravity credentials found");
+            diagnose::log("Antigravity usage poll failed: no Antigravity credentials found and local language server unreachable");
             return Err(PollError::NoCredentials);
         }
     };
@@ -528,12 +706,7 @@ pub(super) fn fetch_antigravity_quota_summary_details(
 pub(super) fn antigravity_summary_has_gemini(
     response: &AntigravityQuotaSummaryResponse,
 ) -> bool {
-    response
-        .groups
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .any(is_antigravity_gemini_summary_group)
+    response.groups().iter().any(is_antigravity_gemini_summary_group)
 }
 
 pub(super) fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSection> {
@@ -559,22 +732,36 @@ pub(super) fn antigravity_section_from_summary_bucket(
 pub(super) fn antigravity_usage_from_summary(
     response: AntigravityQuotaSummaryResponse,
 ) -> Option<UsageData> {
-    let mut fallback = None;
+    let mut best_gemini: Option<UsageData> = None;
+    let mut fallback: Option<UsageData> = None;
 
-    for group in response.groups.unwrap_or_default() {
+    let groups = if let Some(groups) = response.groups {
+        groups
+    } else if let Some(inner) = response.response {
+        inner.groups.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    for group in groups {
         let is_gemini = is_antigravity_gemini_summary_group(&group);
-        let usage = antigravity_usage_from_summary_group(group);
+        let Some(usage) = antigravity_usage_from_summary_group(group) else {
+            continue;
+        };
 
-        if is_gemini && usage.is_some() {
-            return usage;
-        }
-
-        if fallback.is_none() {
-            fallback = usage;
+        if is_gemini {
+            if usage.session.available && usage.weekly.available {
+                return Some(usage);
+            }
+            if best_gemini.is_none() {
+                best_gemini = Some(usage);
+            }
+        } else if fallback.is_none() {
+            fallback = Some(usage);
         }
     }
 
-    fallback
+    best_gemini.or(fallback)
 }
 
 pub(super) fn antigravity_usage_from_summary_group(
@@ -863,5 +1050,41 @@ mod auth_tests {
         assert!(old.token.refresh_token.is_none());
         let current: AntigravityAuthFile = serde_json::from_str(r#"{"token":{"access_token":"old","refresh_token":"refresh","expiry":"2026-01-01T00:00:00Z"}}"#).unwrap();
         assert_eq!(current.token.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    #[test]
+    fn parses_local_language_server_response() {
+        let json = include_str!("../../tests/local_ls_success.json");
+        let response: AntigravityQuotaSummaryResponse = serde_json::from_str(json).unwrap();
+        let usage = antigravity_usage_from_summary(response).expect("should parse usage");
+        assert!(usage.session.available);
+        assert!(usage.weekly.available);
+        // remaining was 0.6183413 for 5h -> percentage used = 38.16587%
+        assert!((usage.session.percentage - 38.16587).abs() < 0.01);
+        // remaining was 0.4763597 for weekly -> percentage used = 52.36403%
+        assert!((usage.weekly.percentage - 52.36403).abs() < 0.01);
+    }
+
+    #[test]
+    fn extracts_csrf_tokens() {
+        assert_eq!(
+            extract_csrf_token("program.exe --csrf_token 810f886e-4637-4998-a8a8-49efc41b48f9 --other"),
+            Some("810f886e-4637-4998-a8a8-49efc41b48f9".into())
+        );
+        assert_eq!(
+            extract_csrf_token("program.exe --csrf_token=\"abc-123\" --other"),
+            Some("abc-123".into())
+        );
+    }
+
+    #[test]
+    fn test_live_local_language_server() {
+        if let Some(usage) = poll_local_language_server() {
+            println!("LIVE USAGE: session={:?} weekly={:?}", usage.session, usage.weekly);
+            assert!(usage.session.available);
+            assert!(usage.weekly.available);
+        } else {
+            println!("Language server not running or not found");
+        }
     }
 }
