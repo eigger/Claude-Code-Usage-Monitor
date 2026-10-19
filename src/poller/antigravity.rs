@@ -337,28 +337,54 @@ pub(super) fn fetch_antigravity_usage_from_endpoint(
     token: &str,
 ) -> Result<UsageData, PollError> {
     let project = fetch_antigravity_project(base_url, token)?;
-    if let Some(project) = project.as_deref() {
-        match fetch_antigravity_quota_summary(base_url, token, project) {
-            Ok(data) => return Ok(data),
+    let summary_result = if let Some(project) = project.as_deref() {
+        match fetch_antigravity_quota_summary_details(base_url, token, project) {
+            Ok(result) => Some(result),
             Err(PollError::AuthRequired) => return Err(PollError::AuthRequired),
-            Err(error) => diagnose::log(format!(
-                "Antigravity retrieveUserQuotaSummary failed, falling back to model quota: {error:?}"
-            )),
+            Err(error) => {
+                diagnose::log(format!(
+                    "Antigravity retrieveUserQuotaSummary failed, falling back to model quota: {error:?}"
+                ));
+                None
+            }
         }
+    } else {
+        None
+    };
+
+    let model_quota = fetch_antigravity_model_quota(base_url, token, project.as_deref());
+    reconcile_antigravity_usage(summary_result, model_quota)
+}
+
+pub(super) fn reconcile_antigravity_usage(
+    summary_result: Option<(UsageData, bool)>,
+    model_quota: Result<UsageSection, PollError>,
+) -> Result<UsageData, PollError> {
+    match (summary_result, model_quota) {
+        (Some((mut summary, has_gemini)), Ok(model_session)) => {
+            // When the quota summary lacks a Gemini-specific group (e.g. daily endpoints
+            // only returning third-party Claude/GPT groups), or when an active individual model
+            // has consumed more than the summary reports, prefer the model quota session.
+            if !has_gemini
+                || !summary.session.available
+                || model_session.percentage > summary.session.percentage
+            {
+                summary.session = model_session;
+            }
+            Ok(summary)
+        }
+        (Some((summary, _)), _) => Ok(summary),
+        (None, Ok(session)) => Ok(UsageData {
+            limits: Vec::new(),
+            session,
+            weekly: UsageSection::default(),
+            weekly_label: None,
+            monthly: None,
+            credits: None,
+            stale: false,
+        }),
+        (None, Err(error)) => Err(error),
     }
-
-    let session = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
-    let weekly = UsageSection::default();
-
-    Ok(UsageData {
-        limits: Vec::new(),
-        session,
-        weekly,
-        weekly_label: None,
-        monthly: None,
-        credits: None,
-        stale: false,
-    })
 }
 
 pub(super) fn fetch_antigravity_project(
@@ -457,11 +483,11 @@ pub(super) fn fetch_antigravity_model_quota(
     .ok_or(PollError::RequestFailed)
 }
 
-pub(super) fn fetch_antigravity_quota_summary(
+pub(super) fn fetch_antigravity_quota_summary_details(
     base_url: &str,
     token: &str,
     project: &str,
-) -> Result<UsageData, PollError> {
+) -> Result<(UsageData, bool), PollError> {
     let agent = build_agent()?;
     let body = serde_json::json!({ "project": project });
 
@@ -494,7 +520,20 @@ pub(super) fn fetch_antigravity_quota_summary(
         }
     };
 
-    antigravity_usage_from_summary(response).ok_or(PollError::RequestFailed)
+    let has_gemini = antigravity_summary_has_gemini(&response);
+    let usage = antigravity_usage_from_summary(response).ok_or(PollError::RequestFailed)?;
+    Ok((usage, has_gemini))
+}
+
+pub(super) fn antigravity_summary_has_gemini(
+    response: &AntigravityQuotaSummaryResponse,
+) -> bool {
+    response
+        .groups
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(is_antigravity_gemini_summary_group)
 }
 
 pub(super) fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSection> {

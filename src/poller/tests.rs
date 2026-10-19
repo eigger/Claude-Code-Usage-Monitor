@@ -468,3 +468,103 @@ fn all_failed_providers_can_carry_their_previous_readings() {
     assert_eq!(claude.session.percentage, 21.0);
     assert!(claude.stale, "the carried reading must be marked stale");
 }
+
+#[test]
+fn antigravity_reconciles_model_quota_when_summary_lacks_gemini() {
+    let summary_usage = UsageData {
+        session: UsageSection {
+            available: true,
+            percentage: 0.0,
+            resets_at: None,
+        },
+        weekly: UsageSection {
+            available: true,
+            percentage: 5.0,
+            resets_at: None,
+        },
+        ..Default::default()
+    };
+    let model_session = UsageSection {
+        available: true,
+        percentage: 32.25,
+        resets_at: None,
+    };
+
+    // When has_gemini is false (only Claude/GPT group was returned by summary),
+    // model quota must override the 0% session.
+    let reconciled = super::antigravity::reconcile_antigravity_usage(
+        Some((summary_usage, false)),
+        Ok(model_session),
+    )
+    .expect("reconciliation should succeed");
+
+    assert_eq!(reconciled.session.percentage, 32.25);
+    assert_eq!(reconciled.weekly.percentage, 5.0);
+}
+
+#[test]
+fn antigravity_prefers_higher_usage_from_model_quota() {
+    let summary_usage = UsageData {
+        session: UsageSection {
+            available: true,
+            percentage: 20.0,
+            resets_at: None,
+        },
+        weekly: UsageSection {
+            available: true,
+            percentage: 10.0,
+            resets_at: None,
+        },
+        ..Default::default()
+    };
+    let model_session = UsageSection {
+        available: true,
+        percentage: 45.0,
+        resets_at: None,
+    };
+
+    let reconciled = super::antigravity::reconcile_antigravity_usage(
+        Some((summary_usage, true)),
+        Ok(model_session),
+    )
+    .expect("reconciliation should succeed");
+
+    assert_eq!(reconciled.session.percentage, 45.0);
+    assert_eq!(reconciled.weekly.percentage, 10.0);
+}
+
+#[test]
+fn antigravity_summary_has_gemini_detects_group() {
+    let without_gemini: super::antigravity::AntigravityQuotaSummaryResponse = serde_json::from_str(
+        r#"{
+            "groups": [
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        { "window": "5h", "remainingFraction": 1.0 },
+                        { "window": "weekly", "remainingFraction": 1.0 }
+                    ]
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+    assert!(!super::antigravity::antigravity_summary_has_gemini(&without_gemini));
+
+    let with_gemini: super::antigravity::AntigravityQuotaSummaryResponse = serde_json::from_str(
+        r#"{
+            "groups": [
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": []
+                },
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": []
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+    assert!(super::antigravity::antigravity_summary_has_gemini(&with_gemini));
+}
